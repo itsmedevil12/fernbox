@@ -1,0 +1,81 @@
+name: benchmark
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: benchmark-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-benchmark:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            runtime/package-lock.json
+            bench/apps/package-lock.json
+
+      - name: Install runtime build dependencies
+        run: npm ci --prefix runtime
+
+      - name: Install benchmark app dependencies
+        run: npm ci --prefix bench/apps
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binaries
+        run: cargo build --release -p fernbox-cli -p fernbox-daemon -p fernbox-worker
+
+      - name: Run HTTP benchmarks
+        run: node bench/run.mjs --binary target/release/fernbox.exe
+
+      - name: Publish report to the job summary
+        if: always()
+        shell: bash
+        run: |
+          if [ -f bench-results/latest.md ]; then
+            cat bench-results/latest.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload binaries
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fernbox-windows-x64
+          path: |
+            target/release/fernbox.exe
+            target/release/fernbox-daemon.exe
+            target/release/fernbox-worker.exe
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: bench-results/
+          if-no-files-found: warn
+          retention-days: 30

@@ -1,0 +1,20 @@
+[workspace]
+members = [
+    "crates/core",
+    "crates/daemon",
+    "crates/proto",
+    "crates/worker",
+    "crates/client",
+    "crates/cli",
+    "crates/napi",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[profile.release]
+lto = true
+codegen-units = 1

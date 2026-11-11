@@ -1,0 +1,5 @@
+NAME=FernBox
+ID=fernbox
+VERSION_ID=0.1
+VARIANT_ID=fernos
+PRETTY_NAME="FernBox 0.1 (fernos)"

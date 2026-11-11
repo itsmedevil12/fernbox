@@ -1,0 +1,17 @@
+{
+  "name": "fernbox-bench-apps",
+  "version": "1.0.0",
+  "private": true,
+  "description": "The same JSON service in Express, Koa, and Fastify, for benchmarking FernBox against plain Node.",
+  "scripts": {
+    "bench": "node ../run.mjs",
+    "express": "node express.js",
+    "koa": "node koa.js",
+    "fastify": "node fastify.js"
+  },
+  "dependencies": {
+    "express": "4.18.2",
+    "fastify": "4.28.1",
+    "koa": "2.15.3"
+  }
+}

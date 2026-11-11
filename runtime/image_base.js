@@ -1,0 +1,1 @@
+globalThis.__fernbox_image = {"/etc/hostname":"fernbox\n","/etc/hosts":"127.0.0.1 localhost\n::1 localhost ip6-localhost ip6-loopback\n","/etc/resolv.conf":"nameserver 127.0.53\noptions attempts:1 timeout:1\n","/usr/share/os-release":"NAME=FernBox\nID=fernbox\nVERSION_ID=0.1\nPRETTY_NAME=\"FernBox 0.1 (base image)\"\n"};

@@ -1,0 +1,4 @@
+{
+  "from": "base",
+  "description": "the FernBox personality: the base commands plus the small toolbox a service needs, in /usr/local/bin"
+}

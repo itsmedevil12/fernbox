@@ -1,0 +1,4 @@
+{
+  "from": "base",
+  "description": "the Ubuntu personality: the base commands as-is, and a Debian-shaped identity. Ubuntu merges /bin into /usr/bin; the filesystem has no symlinks, so the inherited /bin is that one directory"
+}

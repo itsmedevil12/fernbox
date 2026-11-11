@@ -1,0 +1,15 @@
+[package]
+name = "fernbox-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+v8 = { package = "rusty_v8", version = "0.32.1" }
+# Pinned: the virtual-DNS hook lives in `ureq::unversioned::resolver`, which is
+# not covered by ureq's semver guarantees.
+ureq = "=3.4.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Tarball bodies cross the boundary as base64; the crate is the obvious encoder.
+base64 = "0.22"

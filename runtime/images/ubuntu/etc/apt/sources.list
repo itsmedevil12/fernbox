@@ -1,0 +1,6 @@
+# Ubuntu's package sources, as the personality ships them. There is no `apt`
+# command in this image — the sandbox has no package manager — so the file is a
+# statement of which distribution it is, and nothing reads it.
+deb http://archive.ubuntu.com/ubuntu/ noble main restricted
+deb http://archive.ubuntu.com/ubuntu/ noble-updates main restricted
+deb http://security.ubuntu.com/ubuntu/ noble-security main restricted

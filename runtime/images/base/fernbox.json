@@ -1,0 +1,4 @@
+{
+  "from": "minimal",
+  "description": "the common floor: /bin commands, /etc, and the fflate inflator npm needs"
+}

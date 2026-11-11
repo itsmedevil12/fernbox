@@ -1,0 +1,4 @@
+{
+  "from": "minimal",
+  "description": "the Alpine personality: a BusyBox userland of one multi-call binary and applet shims, and no /usr/local/bin at all"
+}

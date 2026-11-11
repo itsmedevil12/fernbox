@@ -1,0 +1,4 @@
+NAME=FernBox
+ID=fernbox
+VERSION_ID=0.1
+PRETTY_NAME="FernBox 0.1 (base image)"

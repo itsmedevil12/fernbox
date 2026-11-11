@@ -1,0 +1,5 @@
+FernBox 0.1 (fernos)
+
+An isolate, not a machine: everything under / is virtual, and /bin holds
+commands rather than binaries. Run them with child_process; require a library
+instead of a command.
