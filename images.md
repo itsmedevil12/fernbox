@@ -252,6 +252,119 @@ with no error, because `-al` was neither `-a` nor `-l`.
 
 ---
 
+## Built images: the FernBoxfile
+
+The five images above are compiled into the binary, so adding one means rebuilding
+Rust. A **FernBoxfile** is the way to make an image without a compiler: a text file
+of keywords in a folder, built into the state directory.
+
+```
+# FernBoxfile
+FROM base
+WORKDIR /app
+ENV NODE_ENV=production
+COPY ./src /app
+COPY ./config.json /app/config.json
+CMD /app/main.js
+```
+
+```
+fernbox build -f FernBoxfile -t my-app
+fernbox run ./anywhere --image my-app --entrypoint /app/main.js
+```
+
+The six keywords are the whole language:
+
+| Keyword | Meaning |
+| --- | --- |
+| `FROM <image>` | the image to layer on; required, exactly once. A bundled name or one built earlier |
+| `COPY <host> <image>` | copy a file or directory tree in. The source stays inside the build context |
+| `RUN <command>` | execute a shell command during the build |
+| `ENV <KEY>=<value>` | an environment default; `ENV KEY value` also works |
+| `CMD <path>` | the entrypoint a run uses when none is given |
+| `WORKDIR <path>` | recorded for reference; the runtime has no `cd` |
+
+**`COPY` respects ignore files.** A `COPY` of a directory applies that directory's
+`.gitignore`, and then its `.fernboxignore`. A context that ignores `node_modules`
+does not copy it; a project that wants something back can re-include it in
+`.fernboxignore` without editing the file its VCS owns. The rules are the subset of
+git's that a build uses: `!` negation, `*`, `?`, `[...]`, `**`, a trailing `/` for
+directories only, a pattern with no `/` matching a name at any depth, and one with
+a `/` anchored to the root. Both ignore files are themselves never copied in, the
+same way git never tracks them.
+
+Two limitations worth knowing. The rules are read once from the **copied**
+directory, not from the build context above it, so `COPY ./src /app` honours
+`src/.gitignore` and not the context's — which is what git does within a submodule
+and what surprises people least. And a file inside an excluded directory cannot be
+re-included, exactly as in git.
+
+**`RUN` is sandboxed.** A build step boots a real worker with the image built so
+far mounted at `/` as a volume, runs the command through the image's own shell,
+and takes the resulting filesystem as the next layer. That means a step gets:
+
+- no network, unless the build's `NetPolicy` grants it (it does not, by default);
+- a 120-second deadline, so a hanging command fails the build rather than the
+  terminal;
+- 256 MiB of heap;
+- the build's own `ENV`, so `ENV NODE_ENV=production` before a `RUN` is what the
+  step sees.
+
+It cannot do anything at build time that the same command could not do at run
+time. That equivalence is the only reason `RUN` is acceptable: the trust story is
+unchanged. A failing step fails the build and writes no image at all, and the
+scratch volume it borrowed is deleted — including on failure.
+
+Ordinary proof that it works:
+
+```dockerfile
+FROM base
+COPY ./src /app
+RUN mkdir -p /node_modules/dep && cat /app/vendor/dep.js > /node_modules/dep/index.js
+ENV NODE_ENV=production
+CMD /app/main.js
+```
+
+The image then contains the dependency, and a run against an empty folder resolves
+it with no `node_modules` on the host.
+
+Note that `base` ships no `cp` — use `cat ... >` or pick an image that has one
+(`fernos` puts `cp` in `/usr/local/bin`).
+
+**Rules the parser enforces**, each because the failure it prevents is confusing
+rather than because it is tidy:
+
+- *Unknown keywords are errors naming the line.* A typo'd `COPY` silently ignored
+  produces an image missing files, and the failure surfaces later as an `ENOENT`
+  in a script.
+- *`COPY` sources are contained.* A source must resolve inside the build context,
+  checked both lexically (no `..`) and after canonicalising, so a symlink cannot
+  walk out either. A build file is shared code and must not be able to read the
+  host.
+- *`COPY` destinations are absolute and free of `..`.* They become real paths
+  under `images/<tag>/`, and a `..` there would escape the image.
+- *Later keywords win.* `ENV` twice sets the second value; a `COPY` onto an
+  existing path replaces it. The same overwrite-in-order rule `commit` uses.
+
+**`CMD` and `ENV` need somewhere to live.** An image is a bare `{path: contents}`
+map and anything inside the directory would be a file in the sandbox, so what the
+build declares about *running* is written beside the image as
+`images/<tag>.meta.json` — a sibling file, which `list_dirs` never mistakes for an
+image. A run merges that metadata under whatever the caller passed, so `--env`
+overrides the build file's default and the caller keeps the last word.
+
+**Running from the image alone.** A run normally reads its entrypoint from the app
+folder on the host. When that file is not there, the daemon falls back to the
+image's copy — which is what makes `fernbox run ./empty --image my-app` work at
+all. A file in the app folder still wins, because that layer sits on top of the
+image in the seed; the app folder is a per-run override.
+
+**A rebuild replaces.** `write_image` clears the image directory first, so a file
+dropped from the FernBoxfile does not survive into the next build. An image is
+meant to be exactly what its build file says.
+
+---
+
 ## Committed images
 
 `fernbox commit <volume> <image> [--from <base>]` freezes a volume over a base

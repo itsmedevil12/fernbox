@@ -75,6 +75,9 @@ pub struct RunOptions {
   /// Grant this loopback port for the run to serve on. The daemon binds
   /// 127.0.0.1:PORT and forwards what arrives; without it, listening is refused.
   pub publish: Option<u16>,
+  /// Stream the script's output as it is written, instead of receiving it all
+  /// in `RunResult.output` at the end. No effect on the reply either way.
+  pub stream: Option<bool>,
   /// Hard lifetime cap in milliseconds for a serving run. Defaults to one hour
   /// when a port is published; ignored otherwise.
   pub max_life_ms: Option<u32>,
@@ -319,6 +322,7 @@ fn run_request(opts: &RunOptions) -> Result<ClientRequest> {
     opts.args.clone().unwrap_or_default(),
     opts.stdin.clone().unwrap_or_default(),
     opts.publish,
+    opts.stream.unwrap_or(false),
     opts.max_life_ms.map(|ms| ms as u64),
   )
   .map_err(|msg| Error::new(Status::InvalidArg, msg))?

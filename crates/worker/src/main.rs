@@ -26,7 +26,8 @@ use fernbox_core::{
     NetRequest, NetResponse, NetPolicy, Vm, VmOutcome,
 };
 use fernbox_proto::{
-    read_frame, write_frame, FetchReply, WorkerInput, WorkerMessage, WorkerOutcome, WorkerRun,
+    read_frame, write_frame, FetchReply, OutputStream, WorkerInput, WorkerMessage, WorkerOutcome,
+    WorkerRun,
 };
 
 mod probe;
@@ -149,6 +150,17 @@ fn run_rpc() -> ExitCode {
         if let Err(err) = write_frame(&mut io::stdout(), &message) {
             eprintln!("error: the response frame could not be written: {err}");
         }
+    }));
+    // Output streams out as the script writes it, so a caller watching a long
+    // run is not left staring at a blank terminal until it ends. The frames are
+    // best-effort: if one cannot be written the run continues, because `Done`
+    // still carries the whole of stdout as the fallback copy.
+    vm.set_output_sink(Box::new(|text, is_stdout| {
+        let message = WorkerMessage::Stdout {
+            text: text.to_string(),
+            stream: if is_stdout { OutputStream::Stdout } else { OutputStream::Stderr },
+        };
+        let _ = write_frame(&mut io::stdout(), &message);
     }));
 
     let outcome = vm.run(&run.script, &params);

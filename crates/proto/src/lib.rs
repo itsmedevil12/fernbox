@@ -103,6 +103,12 @@ pub enum ClientRequest {
         /// the run may not listen at all; `Some(port)` is the allowlist — the
         /// daemon binds 127.0.0.1:port for the run and forwards what arrives.
         publish: Option<u16>,
+        /// Whether the caller wants output as it is written. The daemon streams
+        /// it to its own stderr, which is where a watching human is looking; a
+        /// caller that only wants the final answer leaves this off and reads
+        /// `output` from the reply.
+        #[serde(default)]
+        stream: bool,
     },
     Images,
     Volumes,
@@ -116,6 +122,22 @@ pub enum ClientRequest {
         /// The base image the frozen state is layered over. Defaults to `base`
         /// on the client side, so a bare `commit` still yields a runnable image.
         from: String,
+    },
+    /// Build an image from a FernBoxfile.
+    ///
+    /// The text and the build context travel to the daemon, which parses and
+    /// builds them: the daemon owns the state directory and is the only thing
+    /// that writes images, and a build file may only `COPY` from inside the
+    /// context it names. Nothing is executed, so this needs no worker.
+    Build {
+        /// The FernBoxfile's contents.
+        file: String,
+        /// Absolute path of the directory the file lives in, and the boundary
+        /// every `COPY` source is checked against.
+        context: String,
+        /// The image name to write. When absent the daemon derives one from the
+        /// context directory.
+        tag: Option<String>,
     },
 }
 
@@ -243,6 +265,25 @@ pub enum WorkerMessage {
     /// body of any bytes crosses the string-only boundary intact. The daemon
     /// decodes it and writes it to the waiting connection verbatim.
     HttpResponse { id: u64, raw_b64: String },
+    /// Output the script produced, in the order it produced it.
+    ///
+    /// This is the streaming half of the stdout the `Done` frame also carries:
+    /// a caller watching a long run sees these as they happen instead of one
+    /// lump at the end. `stream` says which pipe it came from, so a client can
+    /// put stderr on stderr rather than folding the two together.
+    ///
+    /// `Done` still carries the full output, so a client that ignores these
+    /// frames (or a daemon built without streaming) still gets everything — the
+    /// chunks are an optimization for liveness, not the only copy.
+    Stdout { text: String, stream: OutputStream },
+}
+
+/// Which of the script's two output pipes a chunk came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputStream {
+    Stdout,
+    Stderr,
 }
 
 /// How the script ended, in the worker's own terms.

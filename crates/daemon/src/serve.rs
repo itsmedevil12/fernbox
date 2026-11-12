@@ -30,6 +30,7 @@ use tokio::runtime;
 use tokio::sync::Semaphore;
 
 use crate::frame::{read_frame_async, write_frame_async};
+use crate::log;
 use crate::state::Daemon;
 use crate::{daemon, handle};
 
@@ -89,16 +90,22 @@ pub fn serve(override_dir: Option<&str>, port: Option<u16>, max_runs: usize) -> 
         return ExitCode::from(5);
     }
 
-    println!(
-        "listening on 127.0.0.1:{port}\n\
-         state: {}\n\
-         {} concurrent run{} at once; the rest queue\n\
-         a client needs the token in {}",
-        root.display(),
-        max_runs,
-        if max_runs == 1 { "" } else { "s" },
-        daemon_json(&root).display()
+    log::banner(
+        env!("CARGO_PKG_VERSION"),
+        &[
+            ("state", root.display().to_string()),
+            ("token", daemon_json(&root).display().to_string()),
+            ("address", format!("127.0.0.1:{port}")),
+            ("runs", format!("{max_runs} at once; the rest queue")),
+        ],
     );
+
+    log::listen(
+        &format!("127.0.0.1:{port}"),
+        &format!("awaiting authenticated clients ({} slot{})", max_runs, if max_runs == 1 { "" } else { "s" }),
+    );
+    log::info("state", "state directory ready", Some(&root.display().to_string()));
+    log::info("auth", "token written out of band", Some(&daemon_json(&root).display().to_string()));
 
     let daemon = Arc::new(daemon);
     let token = Arc::new(token);

@@ -33,6 +33,7 @@ use base64::Engine;
 
 use fernbox_proto::{write_frame, WorkerInput};
 
+use crate::log;
 use crate::spawn::WorkerStdin;
 
 /// The most header bytes a request may carry before the blank line. Anything
@@ -165,17 +166,25 @@ fn serve_connection(mut stream: TcpStream, id: u64, shared: Shared, stop: Arc<At
     // is done, so a service that is being used stays up.
     shared.renew();
 
-    let raw = match read_request(&mut stream) {
+    let mut request_line = String::new();
+    let raw = match read_request(&mut stream, &mut request_line) {
         Ok(raw) => raw,
         Err(response) => {
             // A framing refusal is answered here, in the gate, because it never
             // reached the worker. An empty read (the peer closed) gets no reply.
             if !response.is_empty() {
+                let status = response
+                    .split(|b| *b == b' ')
+                    .nth(1)
+                    .and_then(|s| std::str::from_utf8(s).ok())
+                    .unwrap_or("???");
+                log::rejected(status, &request_line);
                 let _ = stream.write_all(&response);
             }
             return Ok(());
         }
     };
+    log::inbound(&request_line, id, raw.len());
     if stop.load(Ordering::SeqCst) {
         return Ok(());
     }
@@ -217,9 +226,18 @@ fn serve_connection(mut stream: TcpStream, id: u64, shared: Shared, stop: Arc<At
 
     match answer {
         Some(bytes) => {
+            // The status is the first three digits of the response line. The
+            // gate does not otherwise read the worker's bytes, and this peek is
+            // for the log alone — the bytes themselves go out untouched.
+            let status = std::str::from_utf8(&bytes[..bytes.len().min(12)])
+                .ok()
+                .and_then(|s| s.split(' ').nth(1))
+                .unwrap_or("???");
+            log::outbound(status, &request_line, id, bytes.len());
             let _ = stream.write_all(&bytes);
         }
         None => {
+            log::limit("http", &format!("no answer for #{id} within the timeout"), Some(&request_line));
             let _ = stream.write_all(&http_error(503, "Service Unavailable"));
         }
     }
@@ -231,7 +249,13 @@ fn serve_connection(mut stream: TcpStream, id: u64, shared: Shared, stop: Arc<At
 /// send instead. The body is framed by Content-Length; chunked transfer is
 /// refused, because the gate forwards a single buffered request and has no
 /// streaming path to decode it into.
-fn read_request(stream: &mut TcpStream) -> Result<Vec<u8>, Vec<u8>> {
+///
+/// The request line is handed back alongside the bytes so the log can name the
+/// method and path. That is for the *log* only — the gate still does not
+/// interpret the request beyond the framing it needs to bound the read — and it
+/// is a borrowed slice of the buffer the caller already owns, so naming it costs
+/// nothing.
+fn read_request<'a>(stream: &mut TcpStream, line: &'a mut String) -> Result<Vec<u8>, Vec<u8>> {
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 8192];
     let sep = loop {
@@ -260,6 +284,12 @@ fn read_request(stream: &mut TcpStream) -> Result<Vec<u8>, Vec<u8>> {
     if parts.len() != 3 || !parts[2].starts_with("HTTP/") {
         return Err(http_error(400, "Bad Request"));
     }
+    // `METHOD /path` with the version dropped, which is what a log line wants and
+    // what the caller keeps for the duration of the connection.
+    line.clear();
+    line.push_str(parts[0]);
+    line.push(' ');
+    line.push_str(parts[1]);
 
     let mut content_length = 0usize;
     let mut chunked = false;

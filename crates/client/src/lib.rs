@@ -130,6 +130,7 @@ pub struct RunRequest {
     args: Vec<String>,
     stdin: String,
     publish: Option<u16>,
+    stream: bool,
 }
 
 impl RunRequest {
@@ -147,6 +148,7 @@ impl RunRequest {
         args: Vec<String>,
         stdin: String,
         publish: Option<u16>,
+        stream: bool,
         max_life_ms: Option<u64>,
     ) -> Result<RunRequest, String> {
         let app_dir = std::fs::canonicalize(&app_dir)
@@ -196,6 +198,7 @@ impl RunRequest {
             args,
             stdin,
             publish,
+            stream,
         })
     }
 
@@ -214,6 +217,7 @@ impl RunRequest {
             args: self.args.clone(),
             stdin: self.stdin.clone(),
             publish: self.publish,
+            stream: self.stream,
         }
     }
 }
@@ -244,6 +248,7 @@ mod tests {
             vec![],
             stdin,
             None,
+            false,
             None,
         )
         .map(|request| request.to_request())
@@ -296,6 +301,7 @@ mod tests {
             vec![],
             String::new(),
             Some(8080),
+            false,
             Some(60_000),
         )
         .unwrap()
@@ -323,6 +329,7 @@ mod tests {
             vec![],
             String::new(),
             Some(0),
+            false,
             None,
         );
         assert!(result.is_err());

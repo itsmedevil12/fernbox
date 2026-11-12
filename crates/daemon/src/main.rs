@@ -22,10 +22,13 @@ use fernbox_core::{available_embedded_images, embedded_image_json, FsPolicy, Net
 
 use fernbox_proto::{ClientRequest, DaemonResponse, Limits, NetFlags, VolumeSpec};
 
-use crate::state::{compose_seed, load_file_map, parse_volume_spec, Daemon, FileMap, StateDir};
+use crate::state::{compose_seed, load_file_map, merge_file_maps, parse_volume_spec, Daemon, FileMap, StateDir};
 
+mod fernboxfile;
 mod frame;
 mod gate;
+mod ignore;
+pub mod log;
 mod serve;
 mod spawn;
 mod state;
@@ -65,6 +68,8 @@ enum Command {
     Inspect(InspectArgs),
     /// Freeze a volume into a new base image under the state directory.
     Commit(CommitArgs),
+    /// Build an image from a FernBoxfile.
+    Build(BuildArgs),
 }
 
 #[derive(Parser)]
@@ -115,6 +120,10 @@ struct AppArgs {
     /// refused. The grant is the allowlist — the port is open on loopback.
     #[arg(long, value_name = "PORT")]
     publish: Option<u16>,
+    /// Stream the script's output as it is written, instead of only reporting
+    /// it once the run ends.
+    #[arg(long, default_value_t = false)]
+    stream: bool,
     /// Hard lifetime cap in milliseconds for a serving run: the latest instant
     /// activity may renew the idle deadline to. Defaults to one hour when a port
     /// is published; ignored otherwise, where the deadline is already hard.
@@ -136,6 +145,18 @@ struct AppArgs {
     /// Arguments after the entrypoint. `process.argv` sees them at index 2.
     #[arg(last = true)]
     args: Vec<String>,
+}
+
+#[derive(Parser)]
+struct BuildArgs {
+    /// The FernBoxfile to build. Defaults to `FernBoxfile` in the current
+    /// directory.
+    #[arg(long, short = 'f', default_value = "FernBoxfile")]
+    file: PathBuf,
+    /// The image name to write. Defaults to the base image's name with the
+    /// build context's directory name appended, so a build is never unnamed.
+    #[arg(long, short = 't')]
+    tag: Option<String>,
 }
 
 #[derive(Parser)]
@@ -171,6 +192,9 @@ pub fn daemon(override_dir: Option<&str>) -> Result<Daemon, ExitCode> {
 
 fn main() -> ExitCode {
     let args = Args::parse();
+    // Squared once, before anything can write a line: from here on every log
+    // call knows whether it is painting for a terminal or for a pipe.
+    log::init();
 
     match args.command {
         Command::Serve(serve) => {
@@ -222,6 +246,7 @@ fn main() -> ExitCode {
                     args: app.args,
                     stdin,
                     publish: app.publish,
+                    stream: app.stream,
                 },
             ))
         }
@@ -249,6 +274,13 @@ fn main() -> ExitCode {
                 ClientRequest::VolumeFiles { volume: inspect.volume },
             ))
         }
+        Command::Build(build) => {
+            let daemon = match daemon(args.state_dir.as_deref()) {
+                Ok(daemon) => daemon,
+                Err(code) => return code,
+            };
+            build_image(&daemon, &build.file, build.tag.as_deref())
+        }
         Command::Commit(commit) => {
             let daemon = match daemon(args.state_dir.as_deref()) {
                 Ok(daemon) => daemon,
@@ -264,6 +296,282 @@ fn main() -> ExitCode {
             ))
         }
     }
+}
+
+/// Run one `RUN` step: the build's filesystem, the command, and whatever the
+/// command left behind.
+///
+/// The step boots a real worker, because a build command is a program and this
+/// project runs untrusted programs one way. The image built so far is mounted at
+/// `/` as the instance's root volume, so a `mkdir /usr/local/lib` lands in the
+/// image rather than in the disposable writable layer — and `volumeFor`'s root
+/// case is exactly what makes that work.
+///
+/// The returned map is the volume's contents after the command, already merged
+/// over what went in. A step that fails returns the error rather than a partial
+/// map: a half-built image is worse than a failed build.
+fn run_build_step(
+    daemon: &Daemon,
+    files: &FileMap,
+    command: &str,
+    env: &[(String, String)],
+    step: usize,
+) -> Result<FileMap, String> {
+    let state = daemon.state();
+
+    // A scratch volume name unique to this build. The daemon validates it and
+    // the volume is removed on the way out, including on failure — a build that
+    // dies half way must not leave named state behind.
+    let volume_name = format!("build-step-{step}-{}", std::process::id());
+    let volume_json = serde_json::to_string(files)
+        .map_err(|err| format!("cannot serialise the build filesystem: {err}"))?;
+    state.write_volume(&volume_name, &volume_json)?;
+
+    // The command runs through the image's own shell, the same entry point a
+    // script would use, so `RUN` accepts what `sh -c` accepts — pipes, `&&`,
+    // redirection — rather than a pseudo-language this would have to grow.
+    // A non-zero status throws here, which is what fails the build.
+    let script = format!(
+        "const child_process = require(\"child_process\");\n\
+         child_process.execSync({command:?});\n\
+         \"ran\";"
+    );
+    let volumes = serde_json::to_string(&serde_json::json!([{
+        "mount": "/",
+        "files": files,
+    }]))
+    .map_err(|err| format!("cannot encode the build volume: {err}"))?;
+
+    let run = fernbox_proto::WorkerRun {
+        // The image under construction is the volume, so the base layer here is
+        // empty: everything the step sees comes from the files it just built.
+        image: "{}".to_string(),
+        volumes,
+        script,
+        entrypoint: "/build-step.js".to_string(),
+        env: env.iter().map(|(k, v)| format!("{k}={v}")).collect(),
+        args: vec!["sh".to_string(), "-c".to_string(), command.to_string()],
+        stdin: String::new(),
+        memory_limit_mb: 256,
+        // A build step is not a request: it gets a generous ceiling rather than
+        // the request-sized default, but it does still have one.
+        deadline_ms: 120_000,
+        publish: None,
+        max_life_ms: None,
+    };
+
+    let mut worker = match worker::Worker::start(&run) {
+        Ok(worker) => worker,
+        Err(err) => {
+            let _ = remove_volume(state, &volume_name);
+            return Err(format!("cannot start a worker for `RUN {command}`: {err}"));
+        }
+    };
+
+    let outcome = worker.finish(&NetPolicy::default());
+    let _ = remove_volume(state, &volume_name);
+
+    let (outcome, snapshot) = match outcome {
+        Ok(pair) => pair,
+        Err(err) => return Err(format!("`RUN {command}` could not be completed: {err}")),
+    };
+
+    match outcome {
+        fernbox_proto::WorkerOutcome::Completed { output, .. } => {
+            // The command's own output is the build log. Folding it in means a
+            // failed `npm install` says why, in the place a caller is already
+            // reading.
+            for line in output.lines().filter(|line| !line.trim().is_empty()) {
+                eprintln!("  │ {line}");
+            }
+        }
+        fernbox_proto::WorkerOutcome::Threw { message } => {
+            return Err(format!("`RUN {command}` threw: {message}"));
+        }
+        fernbox_proto::WorkerOutcome::Failed { message } => {
+            return Err(format!("`RUN {command}` failed: {message}"));
+        }
+        fernbox_proto::WorkerOutcome::TimedOut => {
+            return Err(format!("`RUN {command}` exceeded its deadline"));
+        }
+        fernbox_proto::WorkerOutcome::OutOfMemory => {
+            return Err(format!("`RUN {command}` ran out of memory"));
+        }
+    }
+
+    // The snapshot is the volume after the command, which is the next layer.
+    let snapshot = match snapshot {
+        Some(snapshot) => snapshot,
+        None => return Err(format!("`RUN {command}` produced no filesystem snapshot")),
+    };
+    let layers: Vec<serde_json::Value> = serde_json::from_str(&snapshot)
+        .map_err(|err| format!("`RUN {command}` returned a malformed snapshot: {err}"))?;
+    let root = layers
+        .iter()
+        .find(|layer| layer.get("mount").and_then(|m| m.as_str()) == Some("/"))
+        .and_then(|layer| layer.get("files"))
+        .ok_or_else(|| format!("`RUN {command}` lost the root volume"))?;
+    let after: FileMap = serde_json::from_value(root.clone())
+        .map_err(|err| format!("`RUN {command}` returned an unreadable file map: {err}"))?;
+
+    // The step's own files are merged over what went in, so a command that
+    // deletes nothing keeps the image, and one that rewrites a file wins.
+    Ok(merge_file_maps(files, &after))
+}
+
+/// Remove a scratch volume, ignoring a failure: the build's own error is the one
+/// worth reporting.
+fn remove_volume(state: &StateDir, name: &str) -> Result<(), String> {
+    state.delete_volume(name)
+}
+
+/// The environment a run sees: the image's defaults, with the caller's on top.
+///
+/// A caller's `KEY=value` replaces the image's `KEY=...` in place. The runtime
+/// builds `process.env` by assigning each pair in order, so a later duplicate
+/// happens to win either way — but relying on that is relying on an ordering
+/// detail of a different crate. The override is decided here instead, and the
+/// image's other variables keep their positions.
+fn merge_env(image: &[(String, String)], caller: &[String]) -> Vec<String> {
+    let mut merged: Vec<String> = image.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    for pair in caller {
+        // A real environment splits on the first `=` only, so a value may hold
+        // one; the key is what precedes it.
+        let key = pair.split('=').next().unwrap_or(pair);
+        match merged.iter_mut().find(|existing| existing.split('=').next() == Some(key)) {
+            Some(slot) => *slot = pair.clone(),
+            None => merged.push(pair.clone()),
+        }
+    }
+    merged
+}
+
+/// Build an image from a FernBoxfile and write it to the state directory.
+///
+/// The build is entirely local: it reads host files, composes a map, and writes
+/// it as an image. No worker is spawned and no sandbox code runs, because none
+/// of the supported keywords execute anything — that is the point of leaving
+/// `RUN` out. Whatever lands under `images/<tag>/` is inert text until a run
+/// mounts it.
+fn build_image(daemon: &Daemon, file: &Path, tag: Option<&str>) -> ExitCode {
+    let text = match std::fs::read_to_string(file) {
+        Ok(text) => text,
+        Err(err) => {
+            eprintln!("error: cannot read {}: {err}", file.display());
+            return ExitCode::from(3);
+        }
+    };
+
+    // The build context is the FernBoxfile's own directory: that is the tree a
+    // `COPY ./src /app` names, and the boundary its containment is checked
+    // against.
+    let context = match std::fs::canonicalize(
+        file.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")),
+    ) {
+        Ok(dir) => dir,
+        Err(err) => {
+            eprintln!("error: cannot read the build context: {err}");
+            return ExitCode::from(3);
+        }
+    };
+
+    match build_request(daemon, &text, &context, tag) {
+        Ok(value) => {
+            println!("completed: {value}");
+            ExitCode::SUCCESS
+        }
+        Err(message) => {
+            eprintln!("error: {message}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// Build an image from a FernBoxfile's text.
+///
+/// Split from [`build_image`] so the local subcommand and the socket request
+/// share it: the CLI reads the file and sends the text, the daemon subcommand
+/// hands over the text it already read. Both must parse, compose and write the
+/// same way, and having one function is the only way to be sure of that.
+fn build_request(
+    daemon: &Daemon,
+    text: &str,
+    context: &Path,
+    tag: Option<&str>,
+) -> Result<String, String> {
+    // Every `COPY` source is resolved against a canonical context, so the
+    // containment check compares two canonically spelled paths.
+    let context = std::fs::canonicalize(context)
+        .map_err(|err| format!("cannot read the build context {}: {err}", context.display()))?;
+
+    let plan = fernboxfile::parse(text, &context)?;
+    let from = plan.from.clone().expect("parse rejects a missing FROM");
+
+    // The base may be a bundled image or one built earlier in this state
+    // directory; `base_image_json` already knows both and reports a clear error
+    // for a name that is neither.
+    let base_json = base_image_json(daemon.state(), &from, embedded_image_json(&from))?;
+    let base: FileMap = serde_json::from_str(&base_json)
+        .map_err(|err| format!("image `{from}` is not a valid file map: {err}"))?;
+
+    let mut built = fernboxfile::build(&plan, &base)?;
+
+    // Every `RUN` step sees what the last one left behind, so they run in order
+    // against a filesystem that grows. This is the only part of a build that
+    // executes anything, and it executes the same sandbox a run uses.
+    for (index, command) in plan.runs.iter().enumerate() {
+        eprintln!("  step {}: RUN {command}", index + 1);
+        built.files = run_build_step(daemon, &built.files, command, &built.env, index)?;
+        eprintln!("  step {}: {} files", index + 1, built.files.len());
+    }
+
+    // A tag is either given or derived from the context directory, so two
+    // builds in different folders do not silently overwrite each other.
+    let tag = tag.map(str::to_string).unwrap_or_else(|| {
+        let name = context
+            .file_name()
+            .and_then(|n| n.to_str())
+            .filter(|n| !n.is_empty())
+            .unwrap_or("app");
+        format!("{from}-{name}")
+    });
+
+    let policy = FsPolicy::default();
+    daemon.state().write_image(&tag, &built.files, &policy)?;
+    // The image is written first: metadata describing an image that failed to
+    // write would be worse than none.
+    let meta = fernboxfile::Meta {
+        env: built.env.clone(),
+        cmd: built.cmd.clone(),
+        workdir: plan.workdir.clone(),
+        from: Some(from.clone()),
+    };
+    daemon.state().write_image_meta(&tag, &meta)?;
+
+    let mut summary = format!("built image `{tag}` from {from}");
+    summary.push_str(&format!(
+        "\n  {} files, {} bytes",
+        built.file_count(),
+        built.bytes(),
+    ));
+    if built.ignored_rules > 0 {
+        summary.push_str(&format!(
+            "\n  {} ignore rule{} respected",
+            built.ignored_rules,
+            if built.ignored_rules == 1 { "" } else { "s" },
+        ));
+    }
+    if !built.env.is_empty() {
+        let vars: Vec<String> = built.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        summary.push_str(&format!("\n  env: {}", vars.join(" ")));
+    }
+    if let Some(cmd) = &built.cmd {
+        summary.push_str(&format!("\n  cmd: {cmd}"));
+    }
+    if let Some(dir) = &plan.workdir {
+        summary.push_str(&format!("\n  workdir: {dir}"));
+    }
+    Ok(summary)
 }
 
 /// An app folder as an absolute path, or why it will not do. Canonicalising also
@@ -322,8 +630,8 @@ pub fn handle(daemon: &Daemon, request: ClientRequest) -> DaemonResponse {
         ClientRequest::Auth { .. } => DaemonResponse::Err {
             message: "auth is the first frame, not a request".into(),
         },
-        ClientRequest::Run { app_dir, entrypoint, image, volumes, limits, net, env, args, stdin, publish } => {
-            run_app(daemon, &app_dir, &entrypoint, &image, &volumes, &limits, &net, &env, &args, &stdin, publish)
+        ClientRequest::Run { app_dir, entrypoint, image, volumes, limits, net, env, args, stdin, publish, stream } => {
+            run_app(daemon, &app_dir, &entrypoint, &image, &volumes, &limits, &net, &env, &args, &stdin, publish, stream)
         }
         ClientRequest::Images => match state.list_images() {
             Ok(on_disk) => DaemonResponse::Images { sources: image_sources(on_disk) },
@@ -337,6 +645,12 @@ pub fn handle(daemon: &Daemon, request: ClientRequest) -> DaemonResponse {
             Ok(files) => DaemonResponse::VolumeFiles { volume, files },
             Err(msg) => DaemonResponse::Err { message: msg },
         },
+        ClientRequest::Build { file, context, tag } => {
+            match build_request(daemon, &file, Path::new(&context), tag.as_deref()) {
+                Ok(value) => DaemonResponse::Ok { value, output: String::new() },
+                Err(message) => DaemonResponse::Err { message },
+            }
+        }
         ClientRequest::Commit { volume, image, from } => {
             commit_volume(daemon, &volume, &image, &from)
         }
@@ -374,8 +688,25 @@ fn run_app(
     args: &[String],
     stdin: &str,
     publish: Option<u16>,
+    stream: bool,
 ) -> DaemonResponse {
     let state = daemon.state();
+    let started = std::time::Instant::now();
+    log::started(
+        "run",
+        &format!("launching {entrypoint}"),
+        Some(&format!(
+            "image {image}{}",
+            if volumes.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " · volumes {}",
+                    volumes.iter().map(|v| format!("{}:{}", v.name, v.mount)).collect::<Vec<_>>().join(", ")
+                )
+            }
+        )),
+    );
     let app_dir = Path::new(app_dir);
     if !app_dir.is_absolute() || !app_dir.is_dir() {
         return DaemonResponse::Err {
@@ -394,8 +725,23 @@ fn run_app(
     let _image_guard = image_lock.hold();
     let base_json = match base_image_json(state, image, embedded_image_json(image)) {
         Ok(json) => json,
-        Err(msg) => return DaemonResponse::Err { message: msg },
+        Err(msg) => {
+            log::error("image", &format!("no image named `{image}`"), Some(&msg));
+            return DaemonResponse::Err { message: msg };
+        }
     };
+    // The image map is a flat `{path: contents}` object, so its key count is
+    // its file count. Parsed only for the log line; a map that does not parse
+    // is reported as unknown rather than failing a run that would otherwise
+    // proceed to a clearer error.
+    // Parsed once and kept: the count goes in the log line, and the map itself
+    // answers "is the entrypoint inside the image?" further down.
+    let image_files: FileMap = serde_json::from_str(&base_json).unwrap_or_default();
+    // A built image may record an `ENV` and a `CMD`; a bundled or committed one
+    // records nothing, and a missing sidecar is not an error.
+    let image_meta = state.load_image_meta(image).unwrap_or_default();
+    let base_files = format!("{} file{}", image_files.len(), if image_files.len() == 1 { "" } else { "s" });
+    log::info("base", &format!("image `{image}`"), Some(&base_files));
     drop(_image_guard);
 
     // The volume locks are held to the end of the run, because the critical
@@ -405,8 +751,48 @@ fn run_app(
     let _volume_guards = volume_locks.hold();
 
     let entrypoint_path = app_dir.join(entrypoint);
+    // Where the script came from decides two things below: whether the app-folder
+    // containment check applies (it guards a host read, so it only applies to a
+    // host read), and what virtual path the top level reports as its own.
+    let mut script_from_image: Option<String> = None;
     let script = match std::fs::read_to_string(&entrypoint_path) {
         Ok(script) => script,
+        // An entrypoint the app folder does not hold may still be part of the
+        // image: a FernBoxfile `CMD /app/main.js` after `COPY ./src /app` names
+        // a file that lives in the image, not on the host. The seed merges the
+        // image underneath the app folder, so the script is already in the
+        // sandbox and only needs reading from there. A file in the app folder
+        // still wins, because that layer sits on top.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            // The entrypoint is named the way it is spelled inside the sandbox,
+            // so `--entrypoint /app/main.js` looks up `/app/main.js`. Joining it
+            // to the app folder first would give `<app_dir>/app/main.js`, whose
+            // stripped form is the same `/app/main.js` — but only by accident,
+            // and only when the caller passed an absolute path. Reading it off
+            // the entrypoint directly is what the image keys actually use.
+            let virtual_entry = virtual_path(app_dir, &entrypoint_path);
+            let image_key = if image_files.contains_key(&virtual_entry) {
+                virtual_entry
+            } else if image_files.contains_key(entrypoint) {
+                entrypoint.to_string()
+            } else {
+                virtual_entry
+            };
+            match image_files.get(&image_key) {
+                Some(contents) => {
+                    script_from_image = Some(image_key.clone());
+                    contents.clone()
+                }
+                None => {
+                    return DaemonResponse::Err {
+                        message: format!(
+                            "cannot read {}: {err} (and the image has no `{image_key}`)",
+                            entrypoint_path.display(),
+                        ),
+                    }
+                }
+            }
+        }
         Err(err) => {
             return DaemonResponse::Err {
                 message: format!("cannot read {}: {err}", entrypoint_path.display()),
@@ -416,7 +802,9 @@ fn run_app(
     // The virtual path the module layer sees the entrypoint at. A `..` component
     // would name somewhere outside the app folder, which is not the client's to
     // read and would also give the top level a `__dirname` that does not exist.
-    if !entrypoint_path.starts_with(app_dir) {
+    // An image-supplied script has no host path to contain: it came out of the
+    // image map, which `write_image` already refused to hold an unsafe key.
+    if script_from_image.is_none() && !entrypoint_path.starts_with(app_dir) {
         return DaemonResponse::Err {
             message: format!("entrypoint {entrypoint} is outside the app folder"),
         };
@@ -426,13 +814,25 @@ fn run_app(
         Ok(files) => files,
         Err(msg) => return DaemonResponse::Err { message: msg },
     };
+    log::fs_event(
+        "layer",
+        &format!("app folder {} file{}", app_files.len(), if app_files.len() == 1 { "" } else { "s" }),
+        Some(&app_dir.display().to_string()),
+    );
 
     // Each volume's prior contents ride along in the seed; an empty volume is an
     // empty mount, so a fresh volume is indistinguishable from a used one.
     let mut volume_files: Vec<(String, FileMap)> = Vec::with_capacity(volumes.len());
     for volume in volumes {
         match state.load_volume(&volume.name) {
-            Ok(files) => volume_files.push((volume.mount.clone(), files)),
+            Ok(files) => {
+                log::stored(
+                    "volume",
+                    &format!("mounting {} at {}", volume.name, volume.mount),
+                    Some(&format!("{} file{} restored", files.len(), if files.len() == 1 { "" } else { "s" })),
+                );
+                volume_files.push((volume.mount.clone(), files));
+            }
             Err(msg) => return DaemonResponse::Err { message: msg },
         }
     }
@@ -440,8 +840,31 @@ fn run_app(
     let policy = FsPolicy::default();
     let seed = match compose_seed(&base_json, &app_files, &volume_files, &policy) {
         Ok(seed) => seed,
-        Err(msg) => return DaemonResponse::Err { message: msg },
+        Err(msg) => {
+            log::error("seed", "could not compose the seed", Some(&msg));
+            return DaemonResponse::Err { message: msg };
+        }
     };
+    let seed_bytes = seed.byte_len();
+    log::info(
+        "seed",
+        "filesystem composed",
+        Some(&format!(
+            "{:.1} KiB of {} MiB budget",
+            seed_bytes as f64 / 1024.0,
+            policy.max_seed_bytes / (1024 * 1024),
+        )),
+    );
+
+    // The image's own `ENV`, with the caller's on top: a build file records a
+    // default, and an explicit `--env` is a deliberate override of it.
+    //
+    // The replacement is done here rather than left to the runtime, which builds
+    // `process.env` by assigning each pair in order and would let a later
+    // duplicate win by luck of ordering. Doing it explicitly means the caller's
+    // value wins because this code decided it should, not because the image's
+    // entry happened to come first.
+    let effective_env = merge_env(&image_meta.env, env);
 
     let net = NetPolicy {
         allow_loopback: net.allow_loopback,
@@ -452,7 +875,10 @@ fn run_app(
     // The virtual path of the entrypoint: the app folder layers at `/`, so
     // `main.js` is `/main.js`. The module layer uses it for the top level's
     // `__dirname`, and relative requires from the entry resolve against it.
-    let virtual_entry = virtual_path(app_dir, &entrypoint_path);
+    let virtual_entry = match &script_from_image {
+        Some(key) => key.clone(),
+        None => virtual_path(app_dir, &entrypoint_path),
+    };
     // A serving run with no explicit cap still gets one: without a ceiling,
     // renewal would keep a service alive forever, and the idle deadline alone
     // would kill one that is merely idle between requests. An hour is the
@@ -463,7 +889,7 @@ fn run_app(
         volumes: seed.volumes,
         script,
         entrypoint: virtual_entry,
-        env: env.to_vec(),
+        env: effective_env,
         args: args.to_vec(),
         stdin: stdin.to_string(),
         memory_limit_mb: limits.memory_mb,
@@ -475,20 +901,63 @@ fn run_app(
     let mut worker = match worker::Worker::start(&run) {
         Ok(worker) => worker,
         Err(err) => {
+            log::error("worker", "could not be spawned", Some(&err.to_string()));
             return DaemonResponse::Err {
                 message: format!("cannot spawn the worker: {err}"),
             }
         }
     };
     let id = worker.id();
+    log::worker(id, &run.entrypoint);
+
+    // Live output, when the caller asked for it. The daemon writes it to its own
+    // stderr under an `out`/`err` label, so a watching human sees the script's
+    // output interleaved with the run's own lines instead of in one lump at the
+    // end. Each chunk is trimmed of its trailing newline so the log does not
+    // develop gaps, and multi-line chunks are logged line by line.
+    if stream {
+        worker.set_output_sink(Box::new(|text: &str, is_stdout: bool| {
+            let label = if is_stdout { "out" } else { "err" };
+            for line in text.lines() {
+                if line.is_empty() {
+                    continue;
+                }
+                log::output(label, line);
+            }
+        }));
+    }
+
     let (outcome, snapshot) = match worker.finish(&net) {
         Ok(pair) => pair,
         Err(err) => {
+            log::error("worker", &format!("pid {id} did not report"), Some(&err.to_string()));
             return DaemonResponse::Err {
                 message: format!("worker {id} did not report: {err}"),
             }
         }
     };
+
+    // The outcome is logged here rather than at the CLI, because this is the
+    // only place that also knows how long it took and who ran it.
+    let elapsed = started.elapsed();
+    let took = format!("{:.0}ms", elapsed.as_secs_f64() * 1000.0);
+    match &outcome {
+        fernbox_proto::WorkerOutcome::Completed { .. } => {
+            log::finished("run", &format!("pid {id} completed in {took}"), Some(entrypoint))
+        }
+        fernbox_proto::WorkerOutcome::Threw { message } => {
+            log::error("run", &format!("pid {id} threw"), Some(message))
+        }
+        fernbox_proto::WorkerOutcome::Failed { message } => {
+            log::error("run", &format!("pid {id} failed"), Some(message))
+        }
+        fernbox_proto::WorkerOutcome::TimedOut => {
+            log::limit("run", &format!("pid {id} hit its {took} deadline"), None)
+        }
+        fernbox_proto::WorkerOutcome::OutOfMemory => {
+            log::limit("run", &format!("pid {id} hit the heap limit after {took}"), None)
+        }
+    }
 
     let response = match outcome {
         fernbox_proto::WorkerOutcome::Completed { value, output } => DaemonResponse::Ok { value, output },
@@ -507,7 +976,15 @@ fn run_app(
     if ran {
         if let Some(snapshot) = snapshot {
             if let Err(msg) = snapshot_volumes(&snapshot, state, volumes, &policy) {
+                log::error("volume", "snapshot was refused", Some(&msg));
                 return DaemonResponse::Err { message: msg };
+            }
+            if !volumes.is_empty() {
+                log::stored(
+                    "volume",
+                    &format!("persisted {} volume{}", volumes.len(), if volumes.len() == 1 { "" } else { "s" }),
+                    Some(&volumes.iter().map(|v| v.name.clone()).collect::<Vec<_>>().join(", ")),
+                );
             }
         }
     }
@@ -887,5 +1364,46 @@ mod render_tests {
         let empty = render_volume_tree("hits", &[]);
         assert!(empty.contains("0 files · 0 B"), "{empty}");
         assert!(empty.contains("└── (empty)"), "{empty}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::merge_env;
+
+    fn pairs(items: &[(&str, &str)]) -> Vec<(String, String)> {
+        items.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn a_caller_env_replaces_the_image_value_in_place() {
+        // "In place" is the claim: the image's other variables keep the order
+        // the build file gave them, so a caller cannot reshuffle the image's
+        // environment by overriding one entry.
+        let image = pairs(&[("A", "1"), ("B", "2"), ("C", "3")]);
+        let merged = merge_env(&image, &["B=override".to_string()]);
+        assert_eq!(merged, vec!["A=1", "B=override", "C=3"]);
+    }
+
+    #[test]
+    fn a_caller_env_adds_a_variable_the_image_does_not_have() {
+        let image = pairs(&[("A", "1")]);
+        let merged = merge_env(&image, &["EXTRA=yes".to_string()]);
+        assert_eq!(merged, vec!["A=1", "EXTRA=yes"]);
+    }
+
+    #[test]
+    fn a_value_may_contain_an_equals_sign() {
+        // Splitting on the first `=` only, as a real environment does: the key
+        // is `A` either way, so this overrides rather than appending.
+        let image = pairs(&[("A", "1")]);
+        let merged = merge_env(&image, &["A=x=y".to_string()]);
+        assert_eq!(merged, vec!["A=x=y"]);
+    }
+
+    #[test]
+    fn an_image_with_no_env_passes_the_callers_through() {
+        let merged = merge_env(&[], &["A=1".to_string(), "B=2".to_string()]);
+        assert_eq!(merged, vec!["A=1", "B=2"]);
     }
 }

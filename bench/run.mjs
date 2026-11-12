@@ -41,6 +41,51 @@ const FRAMEWORKS = [
   { name: "fastify", entry: "fastify.js" },
 ];
 
+// The endpoints every app serves identically. Measuring one route answers "how
+// fast is a JSON response"; these four answer the questions a service actually
+// asks — a plain GET, a route with a parameter and a query string, a POST that
+// parses a body, and a miss that still goes through the router. A runtime that
+// looks fine on `/json` can still be slow at body parsing or at failing.
+const ENDPOINTS = [
+  {
+    name: "json",
+    label: "GET /json",
+    urlPath: "/json",
+    check: (body) => JSON.parse(body).message === "hello world",
+  },
+  {
+    name: "plain",
+    label: "GET /plain",
+    urlPath: "/plain",
+    check: (body) => body === "hello world",
+  },
+  {
+    name: "route",
+    label: "GET /users/:id?q=",
+    urlPath: "/users/42?q=fernbox",
+    check: (body) => {
+      const parsed = JSON.parse(body);
+      return parsed.id === "42" && parsed.q === "fernbox";
+    },
+  },
+  {
+    name: "echo",
+    label: "POST /echo",
+    urlPath: "/echo",
+    method: "POST",
+    body: JSON.stringify({ hello: "world", n: 1 }),
+    headers: { "Content-Type": "application/json" },
+    check: (body) => JSON.parse(body).hello === "world",
+  },
+  {
+    name: "miss",
+    label: "GET /missing",
+    urlPath: "/missing",
+    expectStatus: 404,
+    check: (body) => JSON.parse(body).error === "not found",
+  },
+];
+
 const HELP = `FernBox HTTP benchmark
 
 Usage: node bench/run.mjs [options]
@@ -54,6 +99,8 @@ Options:
   --warmup SECONDS    load before measuring (default: 2)
   --duration SECONDS  measurement window (default: 5)
   --concurrency N     concurrent client connections (default: 32)
+  --no-build          skip the image-build benchmark
+  --build-files N     files in the build context (default: 500)
   --json FILE         JSON report (default: bench-results/latest.json)
   --markdown FILE     Markdown report (default: bench-results/latest.md)
   --help              this text
@@ -69,6 +116,8 @@ function parseArgs(argv) {
     warmup: 2,
     duration: 5,
     concurrency: 32,
+    build: true,
+    buildFiles: 500,
     json: path.join(ROOT, "bench-results", "latest.json"),
     markdown: path.join(ROOT, "bench-results", "latest.md"),
   };
@@ -109,6 +158,12 @@ function parseArgs(argv) {
       case "--concurrency":
         opts.concurrency = Number(value());
         break;
+      case "--no-build":
+        opts.build = false;
+        break;
+      case "--build-files":
+        opts.buildFiles = Number(value());
+        break;
       case "--json":
         opts.json = value();
         break;
@@ -128,6 +183,7 @@ function parseArgs(argv) {
     if (!(opts.warmup >= 0)) throw new Error("--warmup must be zero or more seconds");
     if (!(opts.duration > 0)) throw new Error("--duration must be a positive number of seconds");
     if (!(opts.concurrency >= 1)) throw new Error("--concurrency must be at least 1");
+    if (!(opts.buildFiles >= 1)) throw new Error("--build-files must be at least 1");
     const known = new Set(FRAMEWORKS.map((framework) => framework.name));
     for (const target of opts.targets) {
       if (!known.has(target)) throw new Error(`unknown target ${target}`);
@@ -214,8 +270,17 @@ async function freePort() {
   });
 }
 
-function requestOnce({ port, urlPath = "/", method = "GET", timeoutMs = 5000 }) {
+function requestOnce({
+  port,
+  urlPath = "/",
+  method = "GET",
+  body = null,
+  headers = {},
+  timeoutMs = 5000,
+}) {
   return new Promise((resolve, reject) => {
+    const allHeaders = { Connection: "close", ...headers };
+    if (body !== null) allHeaders["Content-Length"] = Buffer.byteLength(body);
     const request = http.request(
       {
         host: "127.0.0.1",
@@ -223,7 +288,7 @@ function requestOnce({ port, urlPath = "/", method = "GET", timeoutMs = 5000 }) 
         path: urlPath,
         method,
         agent: false,
-        headers: { Connection: "close" },
+        headers: allHeaders,
       },
       (response) => {
         const chunks = [];
@@ -238,7 +303,7 @@ function requestOnce({ port, urlPath = "/", method = "GET", timeoutMs = 5000 }) 
       request.destroy(new Error(`request timed out after ${timeoutMs}ms`)),
     );
     request.on("error", reject);
-    request.end();
+    request.end(body === null ? undefined : body);
   });
 }
 
@@ -249,6 +314,17 @@ async function isHealthy(port) {
   } catch {
     return false;
   }
+}
+
+/// Wait until the server answers `/health`, timing how long that takes.
+///
+/// The duration is reported as startup time. It is measured from the spawn, so it
+/// includes process start, module loading, and the first request — which is what
+/// "how long until it serves traffic" means to whoever is deploying this.
+async function timeUntilReady(port) {
+  const started = performance.now();
+  if (!(await isHealthy(port))) return null;
+  return round(performance.now() - started, 0);
 }
 
 async function waitReady(child, port, output) {
@@ -408,10 +484,11 @@ function percentile(sorted, value) {
   return sorted[Math.max(0, index)];
 }
 
-async function runLoad(port, durationMs, concurrency) {
+async function runLoad(port, durationMs, concurrency, endpoint) {
   const started = performance.now();
   const deadline = started + durationMs;
   const stats = { requests: 0, errors: 0, latencies: [] };
+  const expectedStatus = endpoint.expectStatus ?? 200;
 
   const workers = [];
   for (let index = 0; index < concurrency; index++) {
@@ -420,10 +497,19 @@ async function runLoad(port, durationMs, concurrency) {
         while (performance.now() < deadline) {
           const at = performance.now();
           try {
-            const response = await requestOnce({ port, urlPath: "/json" });
-            if (response.status !== 200) throw new Error(`status ${response.status}`);
-            const parsed = JSON.parse(response.body);
-            if (parsed.message !== "hello world") throw new Error("unexpected body");
+            const response = await requestOnce({
+              port,
+              urlPath: endpoint.urlPath,
+              method: endpoint.method ?? "GET",
+              body: endpoint.body ?? null,
+              headers: endpoint.headers ?? {},
+            });
+            // A wrong status or body counts as an error rather than a success:
+            // a fast runtime answering 500 is not a fast runtime.
+            if (response.status !== expectedStatus) {
+              throw new Error(`status ${response.status}`);
+            }
+            if (!endpoint.check(response.body)) throw new Error("unexpected body");
             stats.requests++;
             stats.latencies.push(performance.now() - at);
           } catch {
@@ -486,10 +572,20 @@ async function stopDaemon(daemon) {
 
 async function runCase({ framework, runtime, binaries, stateDir, appDir, opts }) {
   const port = await freePort();
-  // The app closes itself this long after it starts listening: roughly the
-  // measurement window plus a margin for the harness to finish. The sandbox has
-  // no signals, so a timer is the one reliable way to end a serving run.
-  const closeAfterMs = Math.round((opts.warmup + opts.duration + 5) * 1000);
+  // The app closes itself this long after it starts listening: the measurement
+  // window for *every* endpoint plus a margin for the harness to finish. The
+  // sandbox has no signals, so a timer is the one reliable way to end a serving
+  // run.
+  //
+  // The per-endpoint multiplication is load-bearing. When this only counted one
+  // window, the server closed after the first endpoint and every later one
+  // measured a dead port — 0 requests, thousands of connection errors, which
+  // reads like a runtime that cannot answer a POST rather than a timer set too
+  // short.
+  const endpointWindows = ENDPOINTS.length;
+  const closeAfterMs = Math.round(
+    endpointWindows * (opts.warmup + opts.duration + 2) * 1000 + 5000,
+  );
   const result = {
     framework: framework.name,
     runtime,
@@ -543,7 +639,13 @@ async function runCase({ framework, runtime, binaries, stateDir, appDir, opts })
     }
     output = capture(child);
 
+    const spawnedAt = performance.now();
     await waitReady(child, port, output);
+    // How long until the server could serve traffic at all. Reported per case
+    // because a sandbox that boots in 100 ms and one that boots in 900 ms are
+    // different products, and throughput alone hides that.
+    result.startupMs = round(performance.now() - spawnedAt, 0);
+
     sampler = startSampler(
       runtime === "fernbox"
         ? { names: ["fernbox-daemon", "fernbox-worker"] }
@@ -553,16 +655,32 @@ async function runCase({ framework, runtime, binaries, stateDir, appDir, opts })
     // idle rather than crediting startup work to the measurement.
     await sleep(600);
 
-    await runLoad(port, opts.warmup * 1000, opts.concurrency);
-    const measured = await runLoad(port, opts.duration * 1000, opts.concurrency);
+    // Every endpoint is measured on its own, because they exercise different
+    // work: a router, a parser, a serializer. Summing them would hide which.
+    const endpoints = {};
+    for (const endpoint of ENDPOINTS) {
+      await runLoad(port, opts.warmup * 1000, opts.concurrency, endpoint);
+      endpoints[endpoint.name] = await runLoad(
+        port,
+        opts.duration * 1000,
+        opts.concurrency,
+        endpoint,
+      );
+    }
     result.usage = summarizeSamples(sampler.samples, os.cpus().length);
     await sampler.stop();
     sampler = null;
 
-    Object.assign(result, measured);
-    if (measured.requests === 0) {
+    result.endpoints = endpoints;
+    // `rps` and the latency percentiles at the top level stay the `/json`
+    // numbers, so an older report or a reader expecting one figure still has a
+    // sensible answer.
+    const primary = endpoints.json;
+    Object.assign(result, primary);
+    const successful = Object.values(endpoints).reduce((sum, e) => sum + e.requests, 0);
+    if (successful === 0) {
       throw new Error(
-        `no successful responses (${measured.errors} errors)\n${tail(output())}`,
+        `no successful responses (${primary.errors} errors on /json)\n${tail(output())}`,
       );
     }
 
@@ -589,6 +707,85 @@ async function runCase({ framework, runtime, binaries, stateDir, appDir, opts })
   return result;
 }
 
+/// Time an image build, because a build is now part of the product.
+///
+/// The context is generated rather than checked in: what matters is that the
+/// cost is measured against a known number of files, so "this build takes N ms"
+/// can be read as "N ms for M files" instead of a number with no denominator.
+async function benchBuild({ binaries, stateDir, opts, fileCount }) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "fernbox-bench-build-"));
+  const context = path.join(root, "ctx");
+  const result = {
+    fileCount,
+    ok: false,
+    error: null,
+    copyMs: null,
+    runMs: null,
+    filesPerSecond: null,
+  };
+
+  try {
+    // A tree with some depth, so the walk is not a flat directory of 500 files.
+    for (let i = 0; i < fileCount; i++) {
+      const dir = path.join(context, "src", `d${i % 20}`, `s${i % 7}`);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(
+        path.join(dir, `f${i}.js`),
+        `export const value = ${i};\n`.repeat(4),
+      );
+    }
+    fs.writeFileSync(path.join(context, ".gitignore"), "ignored/\n");
+    fs.mkdirSync(path.join(context, "ignored"), { recursive: true });
+    for (let i = 0; i < 50; i++) {
+      fs.writeFileSync(path.join(context, "ignored", `skip${i}.js`), "not in the image\n");
+    }
+
+    // Copy only: the cost of walking, filtering, and writing an image.
+    fs.writeFileSync(
+      path.join(context, "FernBoxfile"),
+      "FROM base\nCOPY ./src /app\nCMD /app/d0/s0/f0.js\n",
+    );
+    let started = performance.now();
+    const copy = await runCli(binaries.cli, [
+      "--state-dir", stateDir, "build", "-f", path.join(context, "FernBoxfile"), "-t", "bench-copy",
+    ]);
+    result.copyMs = round(performance.now() - started, 0);
+    if (!copy.ok) throw new Error(`copy build failed: ${tail(copy.output)}`);
+
+    // One shell step on top, so the number includes a worker boot and a
+    // snapshot round-trip rather than only file handling.
+    fs.writeFileSync(
+      path.join(context, "FernBoxfile"),
+      "FROM base\nCOPY ./src /app\nRUN echo built > /etc/built.txt\nCMD /app/d0/s0/f0.js\n",
+    );
+    started = performance.now();
+    const withRun = await runCli(binaries.cli, [
+      "--state-dir", stateDir, "build", "-f", path.join(context, "FernBoxfile"), "-t", "bench-run",
+    ]);
+    result.runMs = round(performance.now() - started, 0);
+    if (!withRun.ok) throw new Error(`build with RUN failed: ${tail(withRun.output)}`);
+
+    const elapsedSeconds = result.copyMs / 1000;
+    result.filesPerSecond =
+      elapsedSeconds > 0 ? round(fileCount / elapsedSeconds, 0) : null;
+    result.ok = true;
+  } catch (err) {
+    result.error = err.message;
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  }
+  return result;
+}
+
+/// Run the CLI to completion, capturing its combined output.
+function runCli(cli, args) {
+  return new Promise((resolve) => {
+    const child = spawn(cli, args, { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+    const output = capture(child);
+    waitExit(child, 120_000).then((code) => resolve({ ok: code === 0, output: output() }));
+  });
+}
+
 function buildReport({ opts, binaries, results }) {
   return {
     generatedAt: new Date().toISOString(),
@@ -602,6 +799,7 @@ function buildReport({ opts, binaries, results }) {
       node: process.version,
       binary: binaries?.cli ?? null,
     },
+    build: opts.buildResult ?? null,
     config: {
       endpoint: "GET /json",
       warmupSeconds: opts.warmup,
@@ -634,21 +832,43 @@ function renderMarkdown(report) {
   );
   lines.push("");
   lines.push(
-    "| Framework | Runtime | RPS | p50 ms | p95 ms | p99 ms | errors | RSS peak MB | CPU cores | CPU % of host |",
+    "| Framework | Runtime | RPS | p50 ms | p95 ms | p99 ms | errors | startup ms | RSS peak MB | CPU cores | CPU % of host |",
   );
-  lines.push("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |");
+  lines.push("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |");
 
   for (const result of report.results) {
     if (!result.ok) {
-      lines.push(`| ${result.framework} | ${result.runtime} | failed | - | - | - | - | - | - | - |`);
+      lines.push(
+        `| ${result.framework} | ${result.runtime} | failed | - | - | - | - | - | - | - | - |`,
+      );
       continue;
     }
     lines.push(
       `| ${result.framework} | ${result.runtime} | ${result.rps} | ${result.latencyMs.p50} | ` +
         `${result.latencyMs.p95} | ${result.latencyMs.p99} | ${result.errors} | ` +
+        `${result.startupMs ?? "-"} | ` +
         `${result.usage?.rssPeakMB ?? "-"} | ${result.usage?.coresAvg ?? "-"} | ` +
         `${result.usage?.machinePct ?? "-"} |`,
     );
+  }
+
+  lines.push("");
+  lines.push(
+    "The table above is `GET /json`. Each endpoint is measured separately, because " +
+      "they exercise different work in a runtime:",
+  );
+  lines.push("");
+  lines.push("| Framework | Runtime | " + ENDPOINTS.map((e) => e.label).join(" | ") + " |");
+  lines.push("| --- | --- | " + ENDPOINTS.map(() => "---:").join(" | ") + " |");
+  for (const result of report.results) {
+    if (!result.ok) continue;
+    const cells = ENDPOINTS.map((endpoint) => {
+      const measured = result.endpoints?.[endpoint.name];
+      if (!measured) return "-";
+      const errors = measured.errors > 0 ? ` (${measured.errors} err)` : "";
+      return `${measured.rps}${errors}`;
+    });
+    lines.push(`| ${result.framework} | ${result.runtime} | ${cells.join(" | ")} |`);
   }
 
   const byKey = new Map(
@@ -666,15 +886,39 @@ function renderMarkdown(report) {
     lines.push("");
     lines.push("### FernBox against plain Node");
     lines.push("");
-    lines.push("| Framework | Node RPS | FernBox RPS | FernBox / Node | Node RSS MB | FernBox RSS MB |");
-    lines.push("| --- | ---: | ---: | ---: | ---: | ---: |");
+    lines.push(
+      "| Framework | Node RPS | FernBox RPS | FernBox / Node | Node startup ms | " +
+        "FernBox startup ms | Node RSS MB | FernBox RSS MB |",
+    );
+    lines.push("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |");
     for (const { framework, node, fernbox } of compared) {
       const ratio = node.rps > 0 ? `${round((fernbox.rps / node.rps) * 100, 1)}%` : "-";
       lines.push(
         `| ${framework} | ${node.rps} | ${fernbox.rps} | ${ratio} | ` +
+          `${node.startupMs ?? "-"} | ${fernbox.startupMs ?? "-"} | ` +
           `${node.usage?.rssPeakMB ?? "-"} | ${fernbox.usage?.rssPeakMB ?? "-"} |`,
       );
     }
+  }
+
+  if (report.build?.ok) {
+    const build = report.build;
+    lines.push("");
+    lines.push("### Image build");
+    lines.push("");
+    lines.push(
+      `A FernBoxfile build of ${build.fileCount} files (plus 50 that \`.gitignore\` excludes):`,
+    );
+    lines.push("");
+    lines.push("| Build | ms | files/s |");
+    lines.push("| --- | ---: | ---: |");
+    lines.push(`| \`COPY\` only | ${build.copyMs} | ${build.filesPerSecond ?? "-"} |`);
+    lines.push(`| \`COPY\` + one \`RUN\` | ${build.runMs} | - |`);
+    lines.push("");
+    lines.push(
+      `The difference is what a build step costs: a worker boot plus a filesystem ` +
+        `snapshot, on top of the copy.`,
+    );
   }
 
   const failed = report.results.filter((result) => !result.ok);
@@ -720,6 +964,26 @@ async function main() {
     console.log(`daemon: ${binaries.daemon}`);
     console.log(`state:  ${stateDir}`);
     daemon = await startDaemon(binaries.daemon, stateDir);
+
+    if (opts.build) {
+      console.log("benchmarking image build...");
+      const buildResult = await benchBuild({
+        binaries,
+        stateDir,
+        opts,
+        fileCount: opts.buildFiles,
+      });
+      opts.buildResult = buildResult;
+      if (buildResult.ok) {
+        console.log(
+          `  copy ${buildResult.copyMs} ms for ${buildResult.fileCount} files, ` +
+            `with RUN ${buildResult.runMs} ms`,
+        );
+      } else {
+        console.error(`  failed: ${buildResult.error}`);
+      }
+      writeReports(opts, report());
+    }
 
     const selected = FRAMEWORKS.filter((framework) => opts.targets.includes(framework.name));
     for (const framework of selected) {

@@ -178,6 +178,7 @@ fn serve_request(
         args: Vec::new(),
         stdin: String::new(),
         publish,
+        stream: false,
     }
 }
 

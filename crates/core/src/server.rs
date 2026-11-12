@@ -16,6 +16,12 @@ pub struct IncomingRequest {
     pub raw_b64: String,
 }
 
+/// How output reaches a caller that wants it live: `(text, is_stdout)`. The
+/// worker's sink writes a `Stdout` frame; a test sink collects the chunks. Called
+/// straight from `fernbox.stdio.write`, so it runs with the script's own call on
+/// the stack — which is why it must not re-enter the isolate.
+pub type OutputSink = Box<dyn FnMut(&str, bool)>;
+
 /// How the event loop ships a response: `(id, raw_b64)`. The worker's sink writes
 /// a `WorkerMessage::HttpResponse` frame on the run thread; a test sink collects
 /// them. Called only between callbacks, so it never races a fetch's own write.

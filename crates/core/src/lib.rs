@@ -14,5 +14,5 @@ pub use seed::{
     available_embedded_images, embedded_image_json, validate_mount, validate_name, FsPolicy,
     InstanceSeed,
 };
-pub use server::{IncomingRequest, ResponseSink};
+pub use server::{IncomingRequest, OutputSink, ResponseSink};
 pub use vm::{Vm, VmOutcome};

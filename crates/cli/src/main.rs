@@ -10,10 +10,12 @@
 //! is listening; starting one is `fernbox-daemon serve`.
 
 use std::io::{self, IsTerminal, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+
+mod dev;
 
 use fernbox_client::{state_dir, Endpoint, RunRequest};
 use fernbox_proto::{ClientRequest, DaemonResponse};
@@ -43,6 +45,10 @@ enum Command {
     /// Run an app folder. Its files load as a read-only layer over a base image,
     /// and attached volumes persist their contents across runs.
     Run(AppArgs),
+    /// Run an app folder and rebuild whenever it changes. The same run, repeated
+    /// on every save: a fresh worker boots each time, so nothing carries over
+    /// except volumes.
+    Dev(DevArgs),
     /// List the base images the daemon knows about.
     Images(EmptyArgs),
     /// List the named volumes holding persistent state.
@@ -51,6 +57,8 @@ enum Command {
     Inspect(InspectArgs),
     /// Freeze a volume into a new base image.
     Commit(CommitArgs),
+    /// Build an image from a FernBoxfile.
+    Build(BuildArgs),
 }
 
 #[derive(Parser)]
@@ -88,6 +96,11 @@ struct AppArgs {
     /// — the grant is the allowlist.
     #[arg(long, value_name = "PORT")]
     publish: Option<u16>,
+    /// Stream the script's output as it is written, instead of printing it all
+    /// once the run ends. The daemon relays each chunk to its own stderr, so a
+    /// long run shows progress instead of a blank terminal.
+    #[arg(long, default_value_t = false)]
+    stream: bool,
     /// Hard lifetime cap in milliseconds for a serving run: the latest instant
     /// activity may renew the idle deadline to. Defaults to one hour when a port
     /// is published; ignored otherwise, where the deadline is already hard.
@@ -112,6 +125,63 @@ struct AppArgs {
 }
 
 #[derive(Parser)]
+struct DevArgs {
+    /// The app folder to watch and run.
+    app_dir: PathBuf,
+    /// The file inside the app folder to run.
+    #[arg(long, default_value = "main.js")]
+    entrypoint: String,
+    /// Base image to layer the app folder over.
+    #[arg(long, default_value = "base")]
+    image: String,
+    /// Attach a persistent volume, as `NAME:MOUNT`. Repeatable. Volumes survive
+    /// a rebuild, so state written by one run is there for the next.
+    #[arg(long = "volume", value_name = "NAME:MOUNT")]
+    volumes: Vec<String>,
+    /// CPU deadline in milliseconds for each run.
+    #[arg(long, default_value_t = 5000)]
+    deadline_ms: u64,
+    /// V8 heap limit in megabytes.
+    #[arg(long, default_value_t = 128)]
+    memory_mb: usize,
+    /// Grant this loopback port so the run can serve. Output is always streamed
+    /// under `dev`, so request traffic shows up in the daemon's log as it
+    /// arrives.
+    #[arg(long, value_name = "PORT")]
+    publish: Option<u16>,
+    /// Hard lifetime cap in milliseconds for a serving run.
+    #[arg(long, value_name = "MS")]
+    max_life_ms: Option<u64>,
+    /// Allow the sandbox to connect to loopback addresses.
+    #[arg(long, default_value_t = false)]
+    allow_loopback: bool,
+    /// Allow the sandbox to connect to private (RFC 1918) addresses.
+    #[arg(long, default_value_t = false)]
+    allow_private: bool,
+    /// Per-fetch timeout in seconds, covering every redirect hop.
+    #[arg(long, default_value_t = 10)]
+    net_timeout: u64,
+    /// Set an environment variable, as `KEY=VALUE`. Repeatable.
+    #[arg(long = "env", value_name = "KEY=VALUE")]
+    env: Vec<String>,
+    /// Arguments after the entrypoint. `process.argv` sees them at index 2.
+    #[arg(last = true)]
+    args: Vec<String>,
+}
+
+#[derive(Parser)]
+struct BuildArgs {
+    /// The FernBoxfile to build. Its folder is the build context, and every
+    /// `COPY` source is resolved against it.
+    #[arg(long, short = 'f', default_value = "FernBoxfile")]
+    file: PathBuf,
+    /// The image name to write. Defaults to the base image's name plus the
+    /// context folder's name, so a build is never unnamed.
+    #[arg(long, short = 't')]
+    tag: Option<String>,
+}
+
+#[derive(Parser)]
 struct CommitArgs {
     /// The volume to freeze.
     volume: String,
@@ -124,6 +194,12 @@ struct CommitArgs {
 
 fn main() -> ExitCode {
     let args = Args::parse();
+
+    // `dev` is a loop, not a request, so it gets its own path out of here before
+    // the one-shot plumbing below assumes there is exactly one reply.
+    if let Command::Dev(dev) = &args.command {
+        return dev_command(&args, dev);
+    }
 
     // A bad argument never reaches the daemon, so it is reported before a
     // connection is attempted — no "daemon unreachable" for a missing folder.
@@ -169,6 +245,8 @@ fn main() -> ExitCode {
 /// error.
 fn request_for(command: &Command) -> Result<ClientRequest, String> {
     match command {
+        // Handled above, before the one-shot plumbing assumed a single reply.
+        Command::Dev(_) => unreachable!("dev is dispatched before request_for"),
         Command::Run(app) => {
             // What was piped in is the app's stdin, read in full before the run
             // starts — the sandbox has no way to receive it live, so this is the
@@ -198,6 +276,7 @@ fn request_for(command: &Command) -> Result<ClientRequest, String> {
                 app.args.clone(),
                 stdin,
                 app.publish,
+                app.stream,
                 app.max_life_ms,
             )?
             .to_request())
@@ -206,6 +285,20 @@ fn request_for(command: &Command) -> Result<ClientRequest, String> {
         Command::Volumes(_) => Ok(ClientRequest::Volumes),
         Command::Inspect(inspect) => {
             Ok(ClientRequest::VolumeFiles { volume: inspect.volume.clone() })
+        }
+        Command::Build(build) => {
+            let text = std::fs::read_to_string(&build.file).map_err(|err| {
+                format!("cannot read {}: {err}", build.file.display())
+            })?;
+            let context = std::fs::canonicalize(
+                build.file.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")),
+            )
+            .map_err(|err| format!("cannot read the build context: {err}"))?;
+            Ok(ClientRequest::Build {
+                file: text,
+                context: context.to_string_lossy().into_owned(),
+                tag: build.tag.clone(),
+            })
         }
         Command::Commit(commit) => Ok(ClientRequest::Commit {
             volume: commit.volume.clone(),
@@ -427,4 +520,112 @@ fn human_size(bytes: u64) -> String {
     } else {
         format!("{value:.1} {}", UNITS[unit])
     }
+}
+
+/// `fernbox dev`: build once, then rebuild on every save.
+///
+/// The first build is a plain run, so a broken app is reported before a watcher
+/// is started. After that the loop belongs to [`dev::watch`]: it waits for the
+/// folder to settle, says what changed, and runs again. A rebuild's exit code is
+/// printed but never ends the session — a failing build is the normal reason to
+/// keep watching.
+fn dev_command(args: &Args, dev: &DevArgs) -> ExitCode {
+    let state = match state_dir(args.state_dir.as_deref()) {
+        Ok(dir) => dir,
+        Err(msg) => {
+            eprintln!("error: {msg}");
+            return ExitCode::from(5);
+        }
+    };
+    let endpoint = match Endpoint::resolve(&state, args.port, args.token.clone()) {
+        Ok(endpoint) => endpoint,
+        Err(msg) => {
+            eprintln!("error: {msg}");
+            eprintln!("start one with `fernbox-daemon serve`");
+            return ExitCode::from(7);
+        }
+    };
+
+    let app_dir = match std::fs::canonicalize(&dev.app_dir) {
+        Ok(dir) => dir,
+        Err(err) => {
+            eprintln!("error: app folder {} cannot be read: {err}", dev.app_dir.display());
+            return ExitCode::from(3);
+        }
+    };
+
+    // The request is built once and reused: every rebuild is the same run, so a
+    // rebuild cannot quietly differ from the first build.
+    let request = match dev_request(dev, &app_dir) {
+        Ok(request) => request,
+        Err(msg) => {
+            eprintln!("error: {msg}");
+            return ExitCode::from(3);
+        }
+    };
+
+    eprintln!("watching {}  (ctrl-c to stop)", app_dir.display());
+
+    let mut build = 0u32;
+    let mut first: Option<ExitCode> = None;
+    loop {
+        build += 1;
+        eprintln!();
+        eprintln!("── build {build} ──");
+        match dev::run_once(&endpoint, &request) {
+            Ok(code) => {
+                if first.is_none() {
+                    first = Some(code);
+                }
+            }
+            Err(msg) => {
+                // A lost daemon is not something an edit can fix; say so and
+                // stop rather than rebuilding into the same error forever.
+                eprintln!("error: {msg}");
+                return ExitCode::from(7);
+            }
+        }
+
+        // The watcher owns the loop from here: it blocks until a change settles,
+        // reports it, and the closure runs the next build.
+        dev::watch(&app_dir, |change| {
+            build += 1;
+            eprintln!();
+            eprintln!("changed: {} — starting build {build}", change.summary());
+            match dev::run_once(&endpoint, &request) {
+                Ok(_) => {}
+                Err(msg) => eprintln!("error: {msg}"),
+            }
+        });
+
+        // `watch` only returns if its loop is broken out of; there is no such
+        // path today, but returning the first build's code is the honest answer
+        // if one is ever added.
+        if let Some(code) = first {
+            return code;
+        }
+    }
+}
+
+/// Build the `Run` request `dev` repeats. Volume specs are parsed here rather
+/// than in the daemon so a typo is reported before the watcher starts.
+fn dev_request(dev: &DevArgs, app_dir: &std::path::Path) -> Result<ClientRequest, String> {
+    Ok(RunRequest::new(
+        app_dir.to_path_buf(),
+        dev.entrypoint.clone(),
+        dev.image.clone(),
+        dev.volumes.clone(),
+        dev.deadline_ms,
+        dev.memory_mb,
+        dev.allow_loopback,
+        dev.allow_private,
+        dev.net_timeout,
+        dev.env.clone(),
+        dev.args.clone(),
+        String::new(),
+        dev.publish,
+        true,
+        dev.max_life_ms,
+    )?
+    .to_request())
 }

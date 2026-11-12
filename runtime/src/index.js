@@ -133,9 +133,17 @@ function layerFor(target) {
 
 // The mount matches at the segment boundary — /data owns /data and /data/x but
 // not /datafoo — the same rule REDIRECTS uses.
+//
+// A volume mounted at `/` is the special case that boundary rule cannot express:
+// `${mount}/` is `//`, and no path but the root itself starts with that. Root
+// owns every absolute path by definition, so it is matched directly. Without
+// this, a root mount captured only `/` itself and every real path fell through
+// to a lower layer — which is how an image build that writes through a
+// root-mounted volume silently loses its files.
 function volumeFor(target) {
   return volumes.find(
-    (v) => target === v.mount || target.startsWith(`${v.mount}/`),
+    (v) =>
+      v.mount === "/" || target === v.mount || target.startsWith(`${v.mount}/`),
   );
 }
 

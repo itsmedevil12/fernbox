@@ -93,6 +93,12 @@ pub struct VmState {
     /// the event loop after each callback, so an async handler that answers on a
     /// later timer is shipped just the same.
     pub responses: Vec<(u64, String)>,
+    /// Where each new piece of script output goes, if the caller wants it live.
+    /// Set by the worker to write a `Stdout` frame; left `None` by a bare run,
+    /// where `stdout`/`stderr` above are the whole of it. The buffers are still
+    /// appended to either way, because `Done` carries the full output as the
+    /// fallback copy.
+    pub output_sink: Option<crate::server::OutputSink>,
     /// Where the event loop sends a finished response. The worker writes a frame
     /// to the daemon; a test collects them. `None` drops them (a bare run).
     pub response_sink: Option<crate::server::ResponseSink>,
@@ -195,6 +201,7 @@ impl Vm {
             requests: None,
             responses: Vec::new(),
             response_sink: None,
+            output_sink: None,
         });
 
         // The privileged side gets the gated client: Rust functions the system
@@ -237,6 +244,12 @@ impl Vm {
     /// Set before `run`.
     pub fn set_response_sink(&mut self, sink: crate::server::ResponseSink) {
         self.state.response_sink = Some(sink);
+    }
+
+    /// Hand the isolate the sink that ships output as it is written. Set before
+    /// `run`; without it, output is still buffered and reported at the end.
+    pub fn set_output_sink(&mut self, sink: crate::server::OutputSink) {
+        self.state.output_sink = Some(sink);
     }
 
     /// What the script wrote to its stdout. The daemon reports this alongside
@@ -768,10 +781,21 @@ fn stdio_write(
     };
     let which = arg_string(scope, &args, 1).unwrap_or_default();
     let state = state_of(&args);
-    match which.as_str() {
-        "stdout" => state.stdout.push_str(&text),
-        "stderr" => state.stderr.push_str(&text),
-        _ => {}
+    // The buffer is always appended to — it is what `Done` reports, and what a
+    // run without a sink has instead of streaming. The sink, when there is one,
+    // gets the same bytes as they arrive so a watching caller sees them now
+    // rather than all at the end.
+    let (buffer, is_stdout) = match which.as_str() {
+        "stdout" => (&mut state.stdout, true),
+        "stderr" => (&mut state.stderr, false),
+        _ => {
+            rv.set(v8::undefined(scope).into());
+            return;
+        }
+    };
+    buffer.push_str(&text);
+    if let Some(sink) = state.output_sink.as_mut() {
+        sink(&text, is_stdout);
     }
     rv.set(v8::undefined(scope).into());
 }
@@ -2057,6 +2081,92 @@ mod tests {
             .expect("the /data volume is in the snapshot");
         assert_eq!(files.get("/data/seed.txt").and_then(|v| v.as_str()), Some("seed"));
         assert_eq!(files.get("/data/sub/keep.txt").and_then(|v| v.as_str()), Some("persisted"));
+    }
+
+    #[test]
+    fn a_volume_mounted_at_root_captures_every_path() {
+        // A root mount is the case the segment-boundary rule cannot express:
+        // `${mount}/` is `//`, so matching on it captured only the literal `/`
+        // and every real path fell through to the writable layer. An image build
+        // that writes through a root-mounted volume would lose its files.
+        crate::init_v8();
+        let params = ExecutionParams {
+            memory_limit_mb: 128,
+            deadline: Duration::from_secs(5),
+        };
+        let seed = InstanceSeed {
+            image: embedded_image_json("base").unwrap().to_string(),
+            volumes: r#"[{"mount":"/","files":{}}]"#.to_string(),
+            ..InstanceSeed::empty()
+        };
+        let mut vm = Vm::new(&params, &seed, Box::new(DirectNet(NetPolicy::default())))
+            .expect("the virtual OS booted");
+        vm.run(
+            r#"
+            fernbox.write("/etc/hosts", "127.0.0.1 built.example");
+            fernbox.fs.mkdir("/usr/local/bin");
+            fernbox.write("/usr/local/bin/tool.js", "applet");
+            fernbox.write("/app/main.js", "entry");
+            "#,
+            &params,
+        );
+
+        let snapshot: serde_json::Value = serde_json::from_str(&vm.snapshot().expect("a snapshot"))
+            .expect("the snapshot is json");
+        let files = snapshot
+            .get(0)
+            .and_then(|v| v.get("files"))
+            .and_then(|v| v.as_object())
+            .expect("the root volume is in the snapshot");
+
+        // Every path under `/` belongs to the root mount, not just the root.
+        assert_eq!(
+            files.get("/etc/hosts").and_then(|v| v.as_str()),
+            Some("127.0.0.1 built.example"),
+        );
+        assert_eq!(files.get("/usr/local/bin/tool.js").and_then(|v| v.as_str()), Some("applet"));
+        assert_eq!(files.get("/app/main.js").and_then(|v| v.as_str()), Some("entry"));
+    }
+
+    #[test]
+    fn a_nested_mount_still_wins_over_the_root_mount() {
+        // Two volumes can no longer conflict on a prefix: the first match in
+        // `volumes` wins, and the daemon validates the mounts it attaches. What
+        // must hold is that a root mount does not swallow a nested one, so an
+        // image built with both still keeps the nested volume's subtree.
+        crate::init_v8();
+        let params = ExecutionParams {
+            memory_limit_mb: 128,
+            deadline: Duration::from_secs(5),
+        };
+        let seed = InstanceSeed {
+            image: embedded_image_json("base").unwrap().to_string(),
+            volumes: r#"[
+                {"mount":"/data","files":{}},
+                {"mount":"/","files":{}}
+            ]"#
+            .to_string(),
+            ..InstanceSeed::empty()
+        };
+        let mut vm = Vm::new(&params, &seed, Box::new(DirectNet(NetPolicy::default())))
+            .expect("the virtual OS booted");
+        vm.run(
+            "fernbox.write('/data/keep.txt', 'in data'); fernbox.write('/etc/hosts', 'root');",
+            &params,
+        );
+
+        let snapshot: serde_json::Value = serde_json::from_str(&vm.snapshot().expect("a snapshot"))
+            .expect("the snapshot is json");
+        let data = snapshot.get(0).and_then(|v| v.get("files")).and_then(|v| v.as_object()).unwrap();
+        let root = snapshot.get(1).and_then(|v| v.get("files")).and_then(|v| v.as_object()).unwrap();
+
+        assert_eq!(data.get("/data/keep.txt").and_then(|v| v.as_str()), Some("in data"));
+        assert_eq!(root.get("/etc/hosts").and_then(|v| v.as_str()), Some("root"));
+        // A root mount must not capture the nested volume's subtree.
+        assert!(
+            root.get("/data/keep.txt").is_none(),
+            "the root volume captured a path belonging to /data: {root:?}",
+        );
     }
 
     #[test]

@@ -129,6 +129,7 @@ fn run_request(app_dir: &Path, deadline_ms: u64, volume: Option<&str>) -> Client
         args: Vec::new(),
         stdin: String::new(),
         publish: None,
+        stream: false,
     }
 }
 

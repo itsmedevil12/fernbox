@@ -63,6 +63,51 @@ impl StateDir {
         self.images_dir().join(name)
     }
 
+    /// An image's sidecar metadata.
+    ///
+    /// An image is a bare `{path: contents}` map and has nowhere to carry a
+    /// build file's `ENV` or `CMD` — a file inside the image directory would be
+    /// a file in the sandbox. It lives beside the directory instead, as
+    /// `<name>.meta.json`; `list_dirs` only lists directories, so a sidecar is
+    /// never mistaken for an image.
+    fn image_meta_file(&self, name: &str) -> PathBuf {
+        self.images_dir().join(format!("{name}.meta.json"))
+    }
+
+    /// Write an image's metadata, or clear it when there is nothing to record.
+    pub fn write_image_meta(&self, name: &str, meta: &crate::fernboxfile::Meta) -> Result<(), String> {
+        validate_name(name)?;
+        let file = self.image_meta_file(name);
+        if meta.is_empty() {
+            // A rebuild that declares nothing must not inherit the previous
+            // build's `ENV`.
+            match std::fs::remove_file(&file) {
+                Ok(()) => return Ok(()),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(err) => return Err(format!("cannot clear {}: {err}", file.display())),
+            }
+        }
+        let json = serde_json::to_string(meta)
+            .map_err(|err| format!("cannot serialise metadata for `{name}`: {err}"))?;
+        std::fs::write(&file, json)
+            .map_err(|err| format!("cannot write {}: {err}", file.display()))
+    }
+
+    /// An image's metadata. A missing sidecar is "nothing declared", which is
+    /// the normal case for a bundled or committed image.
+    pub fn load_image_meta(&self, name: &str) -> Result<crate::fernboxfile::Meta, String> {
+        validate_name(name)?;
+        let file = self.image_meta_file(name);
+        match std::fs::read_to_string(&file) {
+            Ok(text) => serde_json::from_str(&text)
+                .map_err(|err| format!("image metadata {} is not valid json: {err}", file.display())),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                Ok(crate::fernboxfile::Meta::default())
+            }
+            Err(err) => Err(format!("cannot read {}: {err}", file.display())),
+        }
+    }
+
     /// A committed image's file map, or `None` if there is no such directory.
     /// Names are validated before they are joined into a path.
     pub fn load_image(&self, name: &str) -> Result<Option<FileMap>, String> {
@@ -102,6 +147,20 @@ impl StateDir {
             ));
         }
         Ok(json)
+    }
+
+    /// Delete a volume's saved state.
+    ///
+    /// A missing volume is success: the caller is cleaning up, and there being
+    /// nothing to clean is the state it asked for. Used by build steps, whose
+    /// scratch volumes exist only for the length of one command.
+    pub fn delete_volume(&self, name: &str) -> Result<(), String> {
+        validate_name(name)?;
+        match std::fs::remove_file(self.volume_file(name)) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(format!("cannot delete volume `{name}`: {err}")),
+        }
     }
 
     /// Write an already-checked volume map to disk, replacing whatever was
@@ -158,6 +217,56 @@ impl StateDir {
                     policy.max_seed_bytes
                 ));
             }
+            let target = root.join(path.trim_start_matches('/'));
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|err| format!("cannot create {}: {err}", parent.display()))?;
+            }
+            std::fs::write(&target, contents)
+                .map_err(|err| format!("cannot write {}: {err}", target.display()))?;
+        }
+        Ok(())
+    }
+
+    /// Write a file map out as an image directory, replacing any image already
+    /// under that name.
+    ///
+    /// This is the write half of a build. `commit_volume` does the same thing
+    /// from a volume's saved state; a FernBoxfile build has the map in memory
+    /// and no volume to round-trip through, so it comes here directly rather
+    /// than writing a scratch volume that would then have to be cleaned up.
+    ///
+    /// The existing directory is removed first, so a rebuild cannot leave a file
+    /// from the previous build that this one no longer copies — an image is
+    /// meant to be exactly what its build file says.
+    pub fn write_image(&self, name: &str, map: &FileMap, policy: &FsPolicy) -> Result<(), String> {
+        validate_name(name)?;
+
+        // The same last check `commit_volume` makes: these keys are about to
+        // become real paths, and a map from anywhere is worth re-checking.
+        let mut total = 0usize;
+        for (path, contents) in map {
+            if !path.starts_with('/') || path.split('/').any(|part| part == "..") {
+                return Err(format!("the image holds an unsafe path: {path}"));
+            }
+            total = total.saturating_add(contents.len());
+        }
+        if total > policy.max_seed_bytes {
+            return Err(format!(
+                "the image is {total} bytes, over the {} byte limit",
+                policy.max_seed_bytes
+            ));
+        }
+
+        let root = self.image_dir(name);
+        if root.exists() {
+            std::fs::remove_dir_all(&root)
+                .map_err(|err| format!("cannot clear {}: {err}", root.display()))?;
+        }
+        std::fs::create_dir_all(&root)
+            .map_err(|err| format!("cannot create {}: {err}", root.display()))?;
+
+        for (path, contents) in map {
             let target = root.join(path.trim_start_matches('/'));
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent)
@@ -424,11 +533,20 @@ pub fn parse_volume_spec(spec: &str) -> Result<(String, String), String> {
 /// service that later tries to read one gets the ordinary ENOENT.
 pub fn load_file_map(dir: &Path) -> Result<FileMap, String> {
     let mut files = FileMap::new();
-    collect(dir, "/", &mut files)?;
+    // The context's own `.gitignore`/`.fernboxignore` apply to the whole walk.
+    // Loading them once at the root rather than per directory matches git: the
+    // rules are declared once and anchor to the folder that declares them.
+    let ignore = crate::ignore::Ignore::load(dir)?;
+    collect(dir, "/", &ignore, &mut files)?;
     Ok(files)
 }
 
-fn collect(dir: &Path, prefix: &str, files: &mut FileMap) -> Result<(), String> {
+fn collect(
+    dir: &Path,
+    prefix: &str,
+    ignore: &crate::ignore::Ignore,
+    files: &mut FileMap,
+) -> Result<(), String> {
     let entries = std::fs::read_dir(dir).map_err(|err| format!("cannot read {}: {err}", dir.display()))?;
     for entry in entries {
         let entry = entry.map_err(|err| format!("cannot read {}: {err}", dir.display()))?;
@@ -443,8 +561,16 @@ fn collect(dir: &Path, prefix: &str, files: &mut FileMap) -> Result<(), String> 
         let file_type = entry
             .file_type()
             .map_err(|err| format!("cannot stat {}: {err}", entry.path().display()))?;
+
+        // Excluded files are the point of an ignore file, so this is a skip
+        // rather than a warning: a context with `node_modules` is normal, and
+        // naming every skipped file would bury the real output.
+        if ignore.matches(&posix, file_type.is_dir()) {
+            continue;
+        }
+
         if file_type.is_dir() {
-            collect(&entry.path(), &format!("{posix}/"), files)?;
+            collect(&entry.path(), &format!("{posix}/"), ignore, files)?;
         } else if file_type.is_file() {
             let bytes = std::fs::read(entry.path())
                 .map_err(|err| format!("cannot read {}: {err}", entry.path().display()))?;

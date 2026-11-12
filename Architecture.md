@@ -32,8 +32,8 @@ Seven crates, one workspace:
 | `core` | the isolate, the virtual OS, net policy, image and seed types | no — it is a library |
 | `proto` | the wire framing between client and daemon | no |
 | `client` | the TCP client the CLI and napi share | no |
-| `cli` | `fernbox run / images / volumes / inspect / commit` | no |
-| `daemon` | the trust root: state dir, volume persistence, image commits, worker spawning | **never** — it links no `Vm::new` path |
+| `cli` | `fernbox run / images / volumes / inspect / commit / build` | no |
+| `daemon` | the trust root: state dir, volume persistence, image commits and builds, worker spawning | **never** — it links no `Vm::new` path |
 | `worker` | a short-lived child process that boots one isolate and answers one run | **yes** |
 | `napi` | the same client as a Node addon | no |
 

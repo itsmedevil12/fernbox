@@ -23,9 +23,10 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use fernbox_core::{gated_fetch, NetPolicy, NetRequest};
+use fernbox_core::{gated_fetch, NetPolicy, NetRequest, OutputSink};
 use fernbox_proto::{
-    read_frame, write_frame, FetchReply, WorkerInput, WorkerMessage, WorkerOutcome, WorkerRun,
+    read_frame, write_frame, FetchReply, OutputStream, WorkerInput, WorkerMessage, WorkerOutcome,
+    WorkerRun,
 };
 
 use crate::gate::{Gate, Shared};
@@ -49,6 +50,9 @@ pub struct Worker {
     messages: mpsc::Receiver<io::Result<Option<WorkerMessage>>>,
     /// The published-port gate, present only when the run was granted a port.
     gate: Option<Gate>,
+    /// Where live output goes, when the caller asked for it. `None` is the
+    /// default: the run's output arrives with `Done` and nowhere sooner.
+    output: Option<OutputSink>,
 }
 
 impl Worker {
@@ -110,7 +114,13 @@ impl Worker {
             None => None,
         };
 
-        Ok(Worker { child, shared, messages: rx, gate })
+        Ok(Worker { child, shared, messages: rx, gate, output: None })
+    }
+
+    /// Hand the worker the sink that receives output as it is written.
+    /// Set before `finish`; without it, output arrives only with the outcome.
+    pub fn set_output_sink(&mut self, sink: OutputSink) {
+        self.output = Some(sink);
     }
 
     /// The worker's process id, for diagnostics when one misbehaves.
@@ -151,6 +161,14 @@ impl Worker {
                     // untrusted, and a frame cannot conjure a connection.
                     if let Some(tx) = self.shared.responses.lock().unwrap().remove(&id) {
                         let _ = tx.send(raw_b64);
+                    }
+                }
+                Some(WorkerMessage::Stdout { text, stream }) => {
+                    // Live output, forwarded to whoever asked for it. A chunk
+                    // with no sink is dropped: `Done` carries the whole of it
+                    // anyway, so nothing is lost by ignoring the stream.
+                    if let Some(sink) = self.output.as_mut() {
+                        sink(&text, stream == OutputStream::Stdout);
                     }
                 }
                 Some(WorkerMessage::Done { outcome, volumes }) => return Ok(Some((outcome, volumes))),
